@@ -40,6 +40,7 @@ import numpy as np
 import sounddevice as sd
 import soundfile as sf
 
+from live_translation.lookup import OllamaWordLookup
 from live_translation.sessions import (
     SessionStore,
     export_subtitles,
@@ -131,6 +132,8 @@ STATUS_UPDATE_INTERVAL_SECONDS = 0.25
 # apostrophes/hyphens ("don't", "well-known"); punctuation stays unclickable.
 WORD_RE = re.compile(r"[A-Za-z]+(?:['\u2019-][A-Za-z]+)*")
 LOOKUP_LINK_PREFIX = "lookup:"
+LOOKUP_MAX_CARDS = 12  # word cards kept in the right column, newest at the bottom
+LOOKUP_QUEUE_SIZE = 8  # clicks waiting for Ollama; more than this are rejected
 # Default mode is word lookup: the right column explains clicked words and the
 # transcript blocks are not translated. --translate-blocks restores the old behaviour.
 BLOCK_TRANSLATION_ENABLED = True
@@ -401,10 +404,13 @@ class GlassOverlay:
         self.translated_text = ""
         self.original_blocks = []
         self.translation_blocks = []
+        self.lookup_cards = []
         self.history_pairs = []  # full, uncapped transcript+translation for export
         # Rebuilt on every transcript render: link index -> {word, block}. Render and
         # click both run on the main thread, so the table is never read mid-rebuild.
         self._word_lookup_table = []
+        self._next_lookup_card_id = 0
+        self.lookup_q = None  # set by main() when the lookup worker runs
         self.session_store = SessionStore()
         self.current_session = self._new_current_session()
         self.session_time_offset_seconds = 0.0
@@ -914,7 +920,7 @@ class GlassOverlay:
         )
         self.translation_label = self._make_label(
             NSTextField,
-            "Translation",
+            "Words" if self.lookup_mode else "Translation",
             self.expanded_frames["translation_label"],
             size=12,
             alpha=0.62,
@@ -1396,6 +1402,7 @@ class GlassOverlay:
         self.history_pairs = self._history_pairs_from_session(self.current_session)
         self.original_blocks = []
         self.translation_blocks = []
+        self.lookup_cards = []
         self.partial_text = ""
         self.partial_translation = ""
         now = time.monotonic()
@@ -1560,6 +1567,7 @@ class GlassOverlay:
         self._persist_current_session()
         self.original_blocks = []
         self.translation_blocks = []
+        self.lookup_cards = []
         self.history_pairs = []
         self.current_session = self._new_current_session()
         self.session_time_offset_seconds = 0.0
@@ -1850,6 +1858,7 @@ class GlassOverlay:
             if self.current_session.get("id") == session.get("id"):
                 self.original_blocks = []
                 self.translation_blocks = []
+                self.lookup_cards = []
                 self.history_pairs = []
                 self.partial_text = ""
                 self.partial_translation = ""
@@ -2461,7 +2470,8 @@ class GlassOverlay:
             committed_attrs,
         )
         self._apply_block_fade(attributed, spans, font)
-        self._apply_word_links(attributed, full_text, spans)
+        if self.lookup_mode:
+            self._apply_word_links(attributed, full_text, spans)
         if partial:
             partial_start = len(full_text) - len(partial)
             partial_attrs = {
@@ -2476,6 +2486,9 @@ class GlassOverlay:
         self.original_view.scrollRangeToVisible_(self.NSMakeRange(len(full_text), 0))
 
     def _render_translation(self):
+        if self.lookup_mode:
+            self._render_lookup_cards()
+            return
         full_text, spans = self._compose_blocks(self.translation_blocks)
         partial = self.partial_translation.strip()
         if partial:
@@ -2513,7 +2526,7 @@ class GlassOverlay:
             block_text = full_text[start : start + length]
             for match in WORD_RE.finditer(block_text):
                 link = f"{LOOKUP_LINK_PREFIX}{len(table)}"
-                table.append({"word": match.group(0), "block": block_text})
+                table.append({"block": block_text, "start": match.start(), "end": match.end()})
                 attributed.addAttribute_value_range_(
                     self.NSLinkAttributeName,
                     link,
@@ -2529,11 +2542,101 @@ class GlassOverlay:
             entry = self._word_lookup_table[int(link[len(LOOKUP_LINK_PREFIX) :])]
         except (ValueError, IndexError):
             return True
-        word, block = entry["word"], entry["block"]
-        print(f"[lookup] clicked {word!r} in: {block}", file=sys.stderr)
-        # Spike: echo into the right column; the real lookup card replaces this later.
-        self.translated_view.setString_(f"{word}\n\n{block}")
+        block, start, end = entry["block"], entry["start"], entry["end"]
+        card = {
+            "id": self._next_lookup_card_id,
+            "word": block[start:end],
+            "status": "pending",
+            "result": None,
+            "error": "",
+        }
+        self._next_lookup_card_id += 1
+        print(f"[lookup] clicked {card['word']!r}", file=sys.stderr)
+        if self.lookup_q is None:
+            card.update(status="error", error="Word lookup is not running.")
+        else:
+            try:
+                self.lookup_q.put_nowait(
+                    {"card_id": card["id"], "text": block, "start": start, "end": end}
+                )
+            except queue.Full:
+                card.update(status="error", error="Too many lookups queued, wait a moment.")
+        self.lookup_cards.append(card)
+        del self.lookup_cards[:-LOOKUP_MAX_CARDS]
+        self._render_translation()
         return True
+
+    def post_lookup_result(self, card_id, result=None, error=""):
+        self.AppHelper.callAfter(self._set_lookup_result, card_id, result, error)
+
+    def _set_lookup_result(self, card_id, result, error):
+        try:
+            card = next((c for c in self.lookup_cards if c["id"] == card_id), None)
+            if card is None:
+                return  # cleared while Ollama was answering
+            if result is not None:
+                card.update(status="done", result=result)
+            else:
+                card.update(status="error", error=str(error or "Lookup failed."))
+            self._render_translation()
+        except Exception as exc:
+            print(f"[lookup] failed to show result: {exc}", file=sys.stderr)
+
+    def _render_lookup_cards(self):
+        size = self.font_size
+        styles = {
+            "word": (self.NSFont.systemFontOfSize_weight_(size, 0.4), 1.0),
+            "lemma": (self.NSFont.systemFontOfSize_weight_(size * 0.8, 0.0), 0.62),
+            "gloss": (self.NSFont.systemFontOfSize_weight_(size * 0.85, 0.3), 1.0),
+            "body": (self.NSFont.systemFontOfSize_weight_(size * 0.75, 0.0), 0.88),
+            "context": (self.NSFont.systemFontOfSize_weight_(size * 0.7, 0.0), 0.55),
+            "context_word": (self.NSFont.systemFontOfSize_weight_(size * 0.7, 0.4), 0.8),
+        }
+        attributed = self.NSMutableAttributedString.alloc().init()
+
+        def add(text, style):
+            font, alpha = styles[style]
+            piece = self.NSMutableAttributedString.alloc().initWithString_attributes_(
+                text,
+                {
+                    self.NSForegroundColorAttributeName: self._text_color(alpha),
+                    self.NSFontAttributeName: font,
+                },
+            )
+            attributed.appendAttributedString_(piece)
+
+        if not self.lookup_cards:
+            add(self._waiting_translation(), "lemma")
+        for idx, card in enumerate(self.lookup_cards):
+            if idx:
+                add("\n\n", "body")
+            result = card.get("result") or {}
+            add(card["word"], "word")
+            lemma = result.get("lemma", "")
+            if lemma and lemma != card["word"].lower():
+                add(f"  → {lemma}", "lemma")
+            if card["status"] == "pending":
+                add("\n…", "context")
+                continue
+            if card["status"] == "error":
+                add(f"\n{card['error']}", "context")
+                continue
+            if result.get("phrase"):
+                add(f"\n{result['phrase']}", "lemma")
+            if result.get("gloss"):
+                add(f"\n{result['gloss']}", "gloss")
+            if result.get("explanation"):
+                add(f"\n{result['explanation']}", "body")
+            context = result.get("context", "")
+            if context:
+                start = int(result.get("context_start") or 0)
+                end = int(result.get("context_end") or 0)
+                add("\n", "context")
+                add(context[:start], "context")
+                add(context[start:end], "context_word")
+                add(context[end:], "context")
+        self.translated_view.textStorage().setAttributedString_(attributed)
+        self.translated_view.scrollRangeToVisible_(self.NSMakeRange(attributed.length(), 0))
 
     def _compose_blocks(self, blocks):
         chunks = []
@@ -3897,6 +4000,31 @@ def streaming_worker(
     Path(temp_path).unlink(missing_ok=True)
 
 
+def lookup_worker(lookup_q, overlay, word_lookup, settings, stop_event):
+    """Serve word clicks one at a time: one Ollama request per click."""
+    while not stop_event.is_set():
+        try:
+            item = lookup_q.get(timeout=0.2)
+        except queue.Empty:
+            continue
+        # Model and explanation language follow the settings panel on the fly.
+        word_lookup.set_model(settings.get_ollama_model())
+        word_lookup.set_language(settings.get()[1])
+        started = time.monotonic()
+        try:
+            result = word_lookup.lookup(item["text"], item["start"], item["end"])
+        except Exception as exc:  # keep the worker alive; the card shows the error
+            print(f"[lookup] failed: {exc}", file=sys.stderr)
+            overlay.post_lookup_result(item["card_id"], error=str(exc))
+            continue
+        print(
+            f"[lookup] {result['word']!r} -> {result['lemma']}: {result['gloss']} "
+            f"({time.monotonic() - started:.1f}s)",
+            file=sys.stderr,
+        )
+        overlay.post_lookup_result(item["card_id"], result=result)
+
+
 def build_translator(args):
     translator = OllamaTranslator(
         model=args.ollama_model,
@@ -4149,6 +4277,19 @@ def main():
             threading.Thread(
                 target=translation_worker,
                 args=(translation_q, overlay, translator, stop_event, settings, reset_gen),
+                daemon=True,
+            )
+        )
+    elif not args.no_window:
+        lookup_q = queue.Queue(maxsize=LOOKUP_QUEUE_SIZE)
+        overlay.lookup_q = lookup_q
+        word_lookup = OllamaWordLookup(
+            model=args.ollama_model, url=args.ollama_url, language=args.target
+        )
+        workers.append(
+            threading.Thread(
+                target=lookup_worker,
+                args=(lookup_q, overlay, word_lookup, settings, stop_event),
                 daemon=True,
             )
         )

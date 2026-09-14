@@ -92,3 +92,74 @@ def test_release_mlx_whisper_model_clears_matching_holder():
     finally:
         ModelHolder.model = previous_model
         ModelHolder.model_path = previous_path
+
+
+class RecordingLookupOverlay:
+    def __init__(self):
+        self.results = []
+
+    def post_lookup_result(self, card_id, result=None, error=""):
+        self.results.append((card_id, result, error))
+
+
+class FakeWordLookup:
+    def __init__(self, fail=False):
+        self.fail = fail
+        self.settings_seen = []
+
+    def set_model(self, model):
+        self.settings_seen.append(("model", model))
+
+    def set_language(self, language):
+        self.settings_seen.append(("language", language))
+
+    def lookup(self, text, start, end):
+        if self.fail:
+            raise RuntimeError("Ollama is not responding.")
+        return {"word": text[start:end], "lemma": "figure", "gloss": "понял"}
+
+
+def run_lookup_worker_until_result(word_lookup, item):
+    import threading
+    import time
+
+    from live_translate_overlay import lookup_worker
+    from live_translation.translators import LanguageSettings
+
+    lookup_q = queue.Queue()
+    lookup_q.put(item)
+    overlay = RecordingLookupOverlay()
+    stop_event = threading.Event()
+    settings = LanguageSettings("en", "ru", ollama_model="qwen3.5:4b")
+    worker = threading.Thread(
+        target=lookup_worker,
+        args=(lookup_q, overlay, word_lookup, settings, stop_event),
+        daemon=True,
+    )
+    worker.start()
+    deadline = time.monotonic() + 2.0
+    while not overlay.results and time.monotonic() < deadline:
+        time.sleep(0.01)
+    stop_event.set()
+    worker.join(timeout=2.0)
+    return overlay.results
+
+
+def test_lookup_worker_posts_result_with_current_settings():
+    word_lookup = FakeWordLookup()
+    text = "I finally figured out why"
+
+    results = run_lookup_worker_until_result(
+        word_lookup, {"card_id": 7, "text": text, "start": 10, "end": 17}
+    )
+
+    assert results == [(7, {"word": "figured", "lemma": "figure", "gloss": "понял"}, "")]
+    assert word_lookup.settings_seen == [("model", "qwen3.5:4b"), ("language", "ru")]
+
+
+def test_lookup_worker_posts_error_and_keeps_running():
+    results = run_lookup_worker_until_result(
+        FakeWordLookup(fail=True), {"card_id": 3, "text": "hello", "start": 0, "end": 5}
+    )
+
+    assert results == [(3, None, "Ollama is not responding.")]
