@@ -127,6 +127,10 @@ CHUNK_PRODUCER_KEEP_CHUNKS = 1
 TRANSLATION_QUEUE_KEEP_TASKS = 1
 SLOW_STEP_LOG_SECONDS = 6.0
 STATUS_UPDATE_INTERVAL_SECONDS = 0.25
+# Words in the transcript that can be clicked for a lookup. Letters plus inner
+# apostrophes/hyphens ("don't", "well-known"); punctuation stays unclickable.
+WORD_RE = re.compile(r"[A-Za-z]+(?:['\u2019-][A-Za-z]+)*")
+LOOKUP_LINK_PREFIX = "lookup:"
 TRANSLATION_TAIL_REGROUP_SECONDS = 8.0
 TRANSLATION_TAIL_MAX_MERGED_CHARS = 420
 TRANSLATION_TAIL_MAX_SOURCE_MERGED_CHARS = 1400
@@ -314,6 +318,7 @@ class GlassOverlay:
                 NSFont,
                 NSFontAttributeName,
                 NSForegroundColorAttributeName,
+                NSLinkAttributeName,
                 NSMakeRange,
                 NSMakeRect,
                 NSMakeSize,
@@ -358,6 +363,7 @@ class GlassOverlay:
         self.NSFont = NSFont
         self.NSFontAttributeName = NSFontAttributeName
         self.NSForegroundColorAttributeName = NSForegroundColorAttributeName
+        self.NSLinkAttributeName = NSLinkAttributeName
         self.NSNormalWindowLevel = NSNormalWindowLevel
         self.NSFloatingWindowLevel = NSFloatingWindowLevel
         self.NSOffState = NSOffState
@@ -378,6 +384,9 @@ class GlassOverlay:
         self.original_blocks = []
         self.translation_blocks = []
         self.history_pairs = []  # full, uncapped transcript+translation for export
+        # Rebuilt on every transcript render: link index -> {word, block}. Render and
+        # click both run on the main thread, so the table is never read mid-rebuild.
+        self._word_lookup_table = []
         self.session_store = SessionStore()
         self.current_session = self._new_current_session()
         self.session_time_offset_seconds = 0.0
@@ -471,8 +480,15 @@ class GlassOverlay:
             def windowDidResize_(delegate_self, notification):
                 self._relayout()
 
+        class TranscriptDelegate(NSObject):
+            # Every word in the transcript carries an NSLinkAttributeName; Cocoa does the
+            # hit-testing and reports single clicks here, while drag-selection keeps working.
+            def textView_clickedOnLink_atIndex_(delegate_self, text_view, link, char_index):
+                return self._word_link_clicked(link)
+
         self.menu_target = MenuTarget.alloc().init()
         self.window_delegate = WindowDelegate.alloc().init()
+        self.transcript_delegate = TranscriptDelegate.alloc().init()
 
         frame = NSMakeRect(120, 700, width, height)
         style = (
@@ -913,6 +929,9 @@ class GlassOverlay:
         visual.addSubview_(self.right_scroll)
 
         self.original_view = self._make_text_view(NSTextView, self.left_scroll)
+        self.original_view.setDelegate_(self.transcript_delegate)
+        # Words are links only for click handling: drop the default blue underline.
+        self.original_view.setLinkTextAttributes_({})
         self.translated_view = self._make_text_view(NSTextView, self.right_scroll)
         self.original_view.setString_(WAITING_ORIGINAL)
         self.translated_view.setString_(self._waiting_translation())
@@ -2422,6 +2441,7 @@ class GlassOverlay:
             committed_attrs,
         )
         self._apply_block_fade(attributed, spans, font)
+        self._apply_word_links(attributed, full_text, spans)
         if partial:
             partial_start = len(full_text) - len(partial)
             partial_attrs = {
@@ -2466,6 +2486,34 @@ class GlassOverlay:
             )
         self.translated_view.textStorage().setAttributedString_(attributed)
         self.translated_view.scrollRangeToVisible_(self.NSMakeRange(len(full_text), 0))
+
+    def _apply_word_links(self, attributed, full_text, spans):
+        table = []
+        for start, length, _idx in spans:
+            block_text = full_text[start : start + length]
+            for match in WORD_RE.finditer(block_text):
+                link = f"{LOOKUP_LINK_PREFIX}{len(table)}"
+                table.append({"word": match.group(0), "block": block_text})
+                attributed.addAttribute_value_range_(
+                    self.NSLinkAttributeName,
+                    link,
+                    self.NSMakeRange(start + match.start(), match.end() - match.start()),
+                )
+        self._word_lookup_table = table
+
+    def _word_link_clicked(self, link):
+        link = str(link or "")
+        if not link.startswith(LOOKUP_LINK_PREFIX):
+            return False
+        try:
+            entry = self._word_lookup_table[int(link[len(LOOKUP_LINK_PREFIX) :])]
+        except (ValueError, IndexError):
+            return True
+        word, block = entry["word"], entry["block"]
+        print(f"[lookup] clicked {word!r} in: {block}", file=sys.stderr)
+        # Spike: echo into the right column; the real lookup card replaces this later.
+        self.translated_view.setString_(f"{word}\n\n{block}")
+        return True
 
     def _compose_blocks(self, blocks):
         chunks = []
