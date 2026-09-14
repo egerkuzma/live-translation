@@ -41,6 +41,7 @@ import sounddevice as sd
 import soundfile as sf
 
 from live_translation.lookup import OllamaWordLookup
+from live_translation.ollama_client import check_ollama, resolve_ollama_url
 from live_translation.sessions import (
     SessionStore,
     export_subtitles,
@@ -4036,7 +4037,7 @@ def lookup_worker(lookup_q, overlay, word_lookup, settings, stop_event):
         overlay.post_lookup_result(item["card_id"], result=result)
 
 
-def build_translator(args):
+def build_translator(args, loaded_models=()):
     translator = OllamaTranslator(
         model=args.ollama_model,
         target=args.target,
@@ -4046,8 +4047,13 @@ def build_translator(args):
         reasoning=args.reasoning,
         source=args.source,
         num_ctx=args.ollama_num_ctx,
+        keep_alive=args.ollama_keep_alive,
     )
-    translator.unload_models_except(GEMMA_MODELS.keys(), args.ollama_model)
+    # Free memory held by our other models, but only ones the server actually has loaded:
+    # no 404 noise for models that were never pulled, and nothing foreign on a shared server.
+    translator.unload_models_except(
+        [model for model in loaded_models if model in GEMMA_MODELS], args.ollama_model
+    )
     return translator
 
 
@@ -4071,7 +4077,18 @@ def parse_args():
         default="qwen3.5:4b",
         help="Ollama Gemma 4 model",
     )
-    p.add_argument("--ollama-url", default="http://127.0.0.1:11434", help="Ollama server URL")
+    p.add_argument(
+        "--ollama-url",
+        default=None,
+        help="Ollama server URL, e.g. http://192.168.1.50:11434; "
+        "default: $OLLAMA_HOST, else http://127.0.0.1:11434",
+    )
+    p.add_argument(
+        "--ollama-keep-alive",
+        default="30m",
+        help="how long the server keeps the model loaded after a request "
+        "(Ollama duration: 5m, 2h; -1 = forever). Default: 30m",
+    )
     p.add_argument("--chunk-seconds", type=float, default=6.0, help="MAX audio chunk (window) size in seconds")
     p.add_argument(
         "--min-chunk-seconds",
@@ -4214,7 +4231,9 @@ def parse_args():
         help="show live draft before finalisation; by default the UI shows only completed blocks",
     )
     p.add_argument("--no-window", action="store_true", help="print to terminal instead of showing window")
-    return p.parse_args()
+    args = p.parse_args()
+    args.ollama_url = resolve_ollama_url(args.ollama_url, os.environ)
+    return args
 
 
 def main():
@@ -4252,8 +4271,14 @@ def main():
 
     global BLOCK_TRANSLATION_ENABLED
     BLOCK_TRANSLATION_ENABLED = bool(args.translate_blocks)
+    ollama = check_ollama(args.ollama_url, args.ollama_model)
+    if ollama["reachable"]:
+        loaded = ", ".join(ollama["loaded"]) or "none"
+        print(f"Ollama {ollama['version']} at {args.ollama_url} (loaded models: {loaded})")
+    if ollama["error"]:
+        print(f"[ollama] {ollama['error']}", file=sys.stderr)
     print("Loading translator...")
-    translator = build_translator(args)
+    translator = build_translator(args, loaded_models=ollama["loaded"])
     right_column = f"translate -> {args.target}" if args.translate_blocks else f"word lookup ({args.target})"
     print(
         f"Start: {info['name']} -> Whisper {args.whisper} -> "
@@ -4295,7 +4320,10 @@ def main():
         lookup_q = queue.Queue(maxsize=LOOKUP_QUEUE_SIZE)
         overlay.lookup_q = lookup_q
         word_lookup = OllamaWordLookup(
-            model=args.ollama_model, url=args.ollama_url, language=args.target
+            model=args.ollama_model,
+            url=args.ollama_url,
+            language=args.target,
+            keep_alive=args.ollama_keep_alive,
         )
         workers.append(
             threading.Thread(

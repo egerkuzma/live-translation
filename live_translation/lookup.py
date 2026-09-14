@@ -9,16 +9,22 @@ Manual check without the overlay:
 
 import argparse
 import json
+import os
 import re
 import sys
 import time
 import urllib.error
 import urllib.request
 
+from live_translation.ollama_client import (
+    DEFAULT_OLLAMA_URL,
+    missing_model_message,
+    resolve_ollama_url,
+    unreachable_message,
+)
 from live_translation.text_pipeline import language_name, strip_llm_noise
 
 DEFAULT_LOOKUP_MODEL = "qwen3.5:4b"
-DEFAULT_OLLAMA_URL = "http://127.0.0.1:11434"
 LOOKUP_FIELDS = ("lemma", "phrase", "gloss", "explanation")
 LOOKUP_SCHEMA = {
     "type": "object",
@@ -136,10 +142,13 @@ class OllamaWordLookup:
         temperature=0.2,
         max_tokens=260,
         timeout=120.0,
+        keep_alive="30m",
     ):
         self.model = model
         self.language = language
-        self.chat_url = url.rstrip("/") + "/api/chat"
+        self.url = url.rstrip("/")
+        self.chat_url = self.url + "/api/chat"
+        self.keep_alive = keep_alive
         self.temperature = temperature
         self.max_tokens = max_tokens
         self.timeout = timeout
@@ -164,7 +173,7 @@ class OllamaWordLookup:
             "stream": False,
             "think": False,
             "format": LOOKUP_SCHEMA,
-            "keep_alive": "30m",
+            "keep_alive": self.keep_alive,
             "options": {"temperature": self.temperature, "num_predict": int(self.max_tokens)},
         }
         req = urllib.request.Request(
@@ -177,13 +186,13 @@ class OllamaWordLookup:
             with urllib.request.urlopen(req, timeout=self.timeout) as resp:
                 body = json.loads(resp.read().decode("utf-8"))
         except urllib.error.HTTPError as exc:
+            if exc.code == 404:
+                raise WordLookupError(missing_model_message(self.url, model)) from exc
             raise WordLookupError(
-                f"Ollama returned HTTP {exc.code} for {model}. Is it pulled? `ollama pull {model}`"
+                f"Ollama at {self.url} returned HTTP {exc.code} for {model}."
             ) from exc
         except (urllib.error.URLError, TimeoutError) as exc:
-            raise WordLookupError(
-                "Ollama is not responding. Start it: `brew services start ollama`."
-            ) from exc
+            raise WordLookupError(unreachable_message(self.url)) from exc
         except ValueError as exc:
             raise WordLookupError("Ollama returned a malformed response") from exc
         fields = parse_lookup_response((body.get("message") or {}).get("content", ""), word)
@@ -203,7 +212,9 @@ def main(argv=None):
     parser.add_argument("word")
     parser.add_argument("context", help="the phrase the word was heard in")
     parser.add_argument("--model", default=DEFAULT_LOOKUP_MODEL)
-    parser.add_argument("--url", default=DEFAULT_OLLAMA_URL)
+    parser.add_argument(
+        "--url", default=None, help="Ollama server URL (default: $OLLAMA_HOST, else local)"
+    )
     parser.add_argument("--lang", default="ru", help="language of the explanation (default: ru)")
     args = parser.parse_args(argv)
     match = re.search(
@@ -211,7 +222,9 @@ def main(argv=None):
     )
     if match is None:
         parser.error(f"{args.word!r} does not occur in the context")
-    lookup = OllamaWordLookup(model=args.model, url=args.url, language=args.lang)
+    lookup = OllamaWordLookup(
+        model=args.model, url=resolve_ollama_url(args.url, os.environ), language=args.lang
+    )
     started = time.monotonic()
     try:
         result = lookup.lookup(args.context, match.start(), match.end())

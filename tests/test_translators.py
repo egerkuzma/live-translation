@@ -1,4 +1,7 @@
 import json
+import urllib.error
+
+import pytest
 
 from live_translation.translators import OllamaTranslator
 
@@ -238,3 +241,27 @@ def test_ollama_unloads_known_models_except_selected(monkeypatch):
     )
 
     assert unloaded == ["gemma4:26b-mlx", "gemma4:e4b-mlx"]
+
+
+def test_ollama_translate_sends_keep_alive_and_explains_missing_model(monkeypatch):
+    captured = {}
+
+    def fake_urlopen(req, timeout):
+        captured["payload"] = json.loads(req.data.decode("utf-8"))
+        raise urllib.error.HTTPError(req.full_url, 404, "Not Found", None, None)
+
+    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+    translator = OllamaTranslator(
+        model="qwen3.5:4b",
+        target="ru",
+        url="http://192.168.1.50:11434/",
+        max_tokens=180,
+        temperature=0.1,
+        reasoning=False,
+        source="en",
+        keep_alive="-1",
+    )
+
+    with pytest.raises(RuntimeError, match="Run `ollama pull qwen3.5:4b` on that server"):
+        translator.translate("hello")
+    assert captured["payload"]["keep_alive"] == "-1"

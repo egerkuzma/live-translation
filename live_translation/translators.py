@@ -8,6 +8,7 @@ import time
 import urllib.error
 import urllib.request
 
+from live_translation.ollama_client import missing_model_message, unreachable_message
 from live_translation.text_pipeline import (
     live_translation_messages,
     strip_llm_noise,
@@ -62,16 +63,19 @@ class OllamaTranslator:
         reasoning,
         source="auto",
         num_ctx=4096,
+        keep_alive="30m",
     ):
         self.model = model
         self.target = target
         self.source = source
-        self.chat_url = url.rstrip("/") + "/api/chat"
+        self.url = url.rstrip("/")
+        self.chat_url = self.url + "/api/chat"
         self.generate_url = url.rstrip("/") + "/api/generate"
         self.max_tokens = max_tokens
         self.temperature = temperature
         self.reasoning = reasoning
         self.num_ctx = num_ctx
+        self.keep_alive = keep_alive
 
     def set_model(self, model):
         if model and model != self.model:
@@ -105,6 +109,13 @@ class OllamaTranslator:
                     )
         except urllib.error.URLError as exc:
             print(f"[translate] failed to unload {model}: {exc}", file=sys.stderr)
+
+    def _connection_error(self, exc):
+        if isinstance(exc, urllib.error.HTTPError):
+            if exc.code == 404:
+                return RuntimeError(missing_model_message(self.url, self.model))
+            return RuntimeError(f"Ollama at {self.url} returned HTTP {exc.code} for {self.model}.")
+        return RuntimeError(unreachable_message(self.url))
 
     def unload_models_except(self, models, keep_model):
         for model in models:
@@ -141,7 +152,7 @@ class OllamaTranslator:
             "messages": live_translation_messages(self.source, self.target, text, history),
             "stream": stream,
             "think": bool(self.reasoning),
-            "keep_alive": "30m",
+            "keep_alive": self.keep_alive,
             "options": options,
         }
         data = json.dumps(payload).encode("utf-8")
@@ -157,10 +168,7 @@ class OllamaTranslator:
             with urllib.request.urlopen(req, timeout=120) as resp:
                 body = json.loads(resp.read().decode("utf-8"))
         except urllib.error.URLError as exc:
-            raise RuntimeError(
-                "Ollama is not responding. Run `ollama serve` and pull the model: "
-                f"`ollama pull {self.model}`."
-            ) from exc
+            raise self._connection_error(exc) from exc
         response = body.get("message", {}).get("content", "")
         return strip_llm_noise(response)
 
@@ -187,10 +195,7 @@ class OllamaTranslator:
                     if chunk.get("done"):
                         break
         except urllib.error.URLError as exc:
-            raise RuntimeError(
-                "Ollama is not responding. Run `ollama serve` and pull the model: "
-                f"`ollama pull {self.model}`."
-            ) from exc
+            raise self._connection_error(exc) from exc
         final = strip_llm_noise("".join(parts))
         # Throttling may have skipped the last tokens — push the complete text once so the
         # live draft is whole even if the commit that follows is briefly delayed.

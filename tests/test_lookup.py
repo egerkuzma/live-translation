@@ -145,3 +145,30 @@ def test_lookup_reports_unreachable_ollama(monkeypatch):
 
     with pytest.raises(WordLookupError, match="not responding"):
         OllamaWordLookup().lookup("hello world", 0, 5)
+
+
+def test_lookup_uses_keep_alive_and_explains_unreachable_remote_server(monkeypatch):
+    payloads = []
+
+    def fake_urlopen(req, timeout):
+        payloads.append(json.loads(req.data.decode("utf-8")))
+        raise urllib.error.URLError("no route to host")
+
+    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+    lookup = OllamaWordLookup(url="http://192.168.1.50:11434", keep_alive="2h")
+
+    with pytest.raises(WordLookupError) as excinfo:
+        lookup.lookup("hello world", 0, 5)
+
+    assert payloads[0]["keep_alive"] == "2h"
+    assert "Ollama at http://192.168.1.50:11434 is not responding" in str(excinfo.value)
+
+
+def test_lookup_explains_model_missing_on_server(monkeypatch):
+    def fake_urlopen(req, timeout):
+        raise urllib.error.HTTPError(req.full_url, 404, "Not Found", None, None)
+
+    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+
+    with pytest.raises(WordLookupError, match="ollama pull qwen3.5:4b` on that server"):
+        OllamaWordLookup(url="http://192.168.1.50:11434").lookup("hello world", 0, 5)
