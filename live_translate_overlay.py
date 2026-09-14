@@ -135,6 +135,7 @@ WORD_RE = re.compile(r"[A-Za-z]+(?:['\u2019-][A-Za-z]+)*")
 LOOKUP_LINK_PREFIX = "lookup:"
 LOOKUP_MAX_CARDS = 12  # word cards kept in the right column, newest at the bottom
 LOOKUP_QUEUE_SIZE = 8  # clicks waiting for Ollama; more than this are rejected
+PHRASE_MAX_WORDS = 8  # a longer selection is reading along, not a phrase lookup
 # Default mode is word lookup: the right column explains clicked words and the
 # transcript blocks are not translated. --translate-blocks restores the old behaviour.
 BLOCK_TRANSLATION_ENABLED = True
@@ -411,6 +412,7 @@ class GlassOverlay:
         # click both run on the main thread, so the table is never read mid-rebuild.
         self._word_lookup_table = []
         self._next_lookup_card_id = 0
+        self._rendering_transcript = False  # selection changes during a re-render are ours
         self.lookup_q = None  # set by main() when the lookup worker runs
         self.session_store = SessionStore()
         self.current_session = self._new_current_session()
@@ -510,6 +512,11 @@ class GlassOverlay:
             # hit-testing and reports single clicks here, while drag-selection keeps working.
             def textView_clickedOnLink_atIndex_(delegate_self, text_view, link, char_index):
                 return self._word_link_clicked(link)
+
+            def textViewDidChangeSelection_(delegate_self, notification):
+                # Posted once when a drag-selection ends (not while dragging), and also when
+                # re-renders move the caret; a multi-word selection is a phrase lookup.
+                self._transcript_selection_changed()
 
         self.menu_target = MenuTarget.alloc().init()
         self.window_delegate = WindowDelegate.alloc().init()
@@ -2486,7 +2493,11 @@ class GlassOverlay:
             # uncommitted for a long time. A click snapshots the draft text as it is now.
             link_spans = spans + ([(partial_start, len(partial), len(spans))] if partial else [])
             self._apply_word_links(attributed, full_text, link_spans)
-        self.original_view.textStorage().setAttributedString_(attributed)
+        self._rendering_transcript = True
+        try:
+            self.original_view.textStorage().setAttributedString_(attributed)
+        finally:
+            self._rendering_transcript = False
         self._scroll_to_end(self.original_view)
 
     def _render_translation(self):
@@ -2537,7 +2548,14 @@ class GlassOverlay:
             for match in WORD_RE.finditer(block_text):
                 link = f"{LOOKUP_LINK_PREFIX}{len(table)}"
                 table.append(
-                    {"block": lookup_text, "start": shift + match.start(), "end": shift + match.end()}
+                    {
+                        "block": lookup_text,
+                        "start": shift + match.start(),
+                        "end": shift + match.end(),
+                        "span": start,
+                        "abs_start": start + match.start(),
+                        "abs_end": start + match.end(),
+                    }
                 )
                 attributed.addAttribute_value_range_(
                     self.NSLinkAttributeName,
@@ -2554,7 +2572,21 @@ class GlassOverlay:
             entry = self._word_lookup_table[int(link[len(LOOKUP_LINK_PREFIX) :])]
         except (ValueError, IndexError):
             return True
-        block, start, end = entry["block"], entry["start"], entry["end"]
+        return self._queue_lookup(entry["block"], entry["start"], entry["end"], "clicked")
+
+    def _transcript_selection_changed(self):
+        if self._rendering_transcript or not self.lookup_mode:
+            return
+        selected = self.original_view.selectedRange()
+        if selected.length == 0:
+            return
+        phrase = phrase_for_selection(
+            self._word_lookup_table, selected.location, selected.location + selected.length
+        )
+        if phrase is not None:
+            self._queue_lookup(*phrase, "selected")
+
+    def _queue_lookup(self, block, start, end, action):
         card = {
             "id": self._next_lookup_card_id,
             "word": block[start:end],
@@ -2563,7 +2595,7 @@ class GlassOverlay:
             "error": "",
         }
         self._next_lookup_card_id += 1
-        print(f"[lookup] clicked {card['word']!r}", file=sys.stderr)
+        print(f"[lookup] {action} {card['word']!r}", file=sys.stderr)
         if self.lookup_q is None:
             card.update(status="error", error="Word lookup is not running.")
         else:
@@ -2689,6 +2721,18 @@ class GlassOverlay:
     def stop(self):
         self.stop_event.set()
         self.AppHelper.callAfter(self.AppHelper.stopEventLoop)
+
+
+def phrase_for_selection(word_table, sel_start, sel_end, max_words=PHRASE_MAX_WORDS):
+    """Map a transcript selection to (lookup_text, start, end) spanning the whole words it touches.
+
+    Returns None unless the selection covers 2..max_words words inside one paragraph or the
+    draft: a single word is already a click, and a long selection is not a phrase.
+    """
+    words = [e for e in word_table if e["abs_start"] < sel_end and e["abs_end"] > sel_start]
+    if not 2 <= len(words) <= max_words or len({e["span"] for e in words}) != 1:
+        return None
+    return words[0]["block"], words[0]["start"], words[-1]["end"]
 
 
 def put_drop_oldest(q, item):

@@ -163,3 +163,54 @@ def test_lookup_worker_posts_error_and_keeps_running():
     )
 
     assert results == [(3, None, "Ollama is not responding.")]
+
+
+def word_table_for(paragraphs):
+    """Build the overlay's link table for paragraphs laid out one after another."""
+    from live_translate_overlay import WORD_RE
+
+    table, pos = [], 0
+    for text in paragraphs:
+        for match in WORD_RE.finditer(text):
+            table.append(
+                {
+                    "block": text,
+                    "start": match.start(),
+                    "end": match.end(),
+                    "span": pos,
+                    "abs_start": pos + match.start(),
+                    "abs_end": pos + match.end(),
+                }
+            )
+        pos += len(text) + 2
+    return table
+
+
+def test_phrase_for_selection_extends_to_whole_words():
+    from live_translate_overlay import phrase_for_selection
+
+    text = "This doesn't make any sense to me so frustrating"
+    table = word_table_for([text])
+    sel_start = text.index("make") + 2  # "ke any sen"
+    sel_end = text.index("sense") + 3
+
+    block, start, end = phrase_for_selection(table, sel_start, sel_end)
+
+    assert block[start:end] == "make any sense"
+
+
+def test_phrase_for_selection_ignores_single_words_long_and_cross_paragraph_selections():
+    from live_translate_overlay import phrase_for_selection
+
+    first = "It is not a big deal."
+    second = "We can fix it later tonight or tomorrow morning if needed."
+    table = word_table_for([first, second])
+    second_start = len(first) + 2
+
+    assert phrase_for_selection(table, first.index("big"), first.index("big") + 3) is None
+    assert phrase_for_selection(table, first.index("deal"), second_start + 5) is None
+    assert phrase_for_selection(table, second_start, second_start + len(second)) is None
+    assert phrase_for_selection(table, first.index("big"), first.index("deal") + 4)[1:] == (
+        first.index("big"),
+        first.index("deal") + 4,
+    )
