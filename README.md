@@ -115,6 +115,33 @@ done
 
 Recommended preset: **Whisper Turbo + Gemma 4 26B**
 
+#### Ollama on another machine
+
+Ollama can run on any machine in your LAN. This keeps the Mac's memory for Whisper:
+a local model sitting idle in memory measurably slows transcription on a 16 GB Mac.
+
+On the server, make Ollama listen on the network and pull the model:
+
+```bash
+OLLAMA_HOST=0.0.0.0:11434 ollama serve   # or set OLLAMA_HOST in its systemd unit
+ollama pull qwen3.5:4b
+```
+
+On the Mac, pass the server URL, or set the same variable the `ollama` CLI reads:
+
+```bash
+./.venv/bin/python live_translate_overlay.py --ollama-url http://my-server:11434
+# or
+export OLLAMA_HOST=my-server
+./.venv/bin/python live_translate_overlay.py
+```
+
+At startup the overlay prints whether the server answers, whether the model is pulled
+there and which models are loaded. `--ollama-keep-alive` sets how long the server keeps
+the model loaded after a request: `30m` by default, `-1` keeps it loaded.
+
+Ollama has no authentication. Do not expose port 11434 outside your LAN.
+
 ### Run
 
 Launch `LiveTranslate.app`, or run:
@@ -185,6 +212,8 @@ The LLM receives complete sentences plus recent context, producing more coherent
 --target LANGUAGE
 --whisper MODEL
 --ollama-model MODEL
+--ollama-url URL
+--ollama-keep-alive DURATION
 --silence-rms VALUE
 --vad-min-speech-ms VALUE
 --audio-queue SIZE
