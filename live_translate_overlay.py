@@ -2470,8 +2470,6 @@ class GlassOverlay:
             committed_attrs,
         )
         self._apply_block_fade(attributed, spans, font)
-        if self.lookup_mode:
-            self._apply_word_links(attributed, full_text, spans)
         if partial:
             partial_start = len(full_text) - len(partial)
             partial_attrs = {
@@ -2482,6 +2480,11 @@ class GlassOverlay:
                 partial_attrs,
                 self.NSMakeRange(partial_start, len(partial)),
             )
+        if self.lookup_mode:
+            # The grey draft is clickable too: without pauses in speech it can stay
+            # uncommitted for a long time. A click snapshots the draft text as it is now.
+            link_spans = spans + ([(partial_start, len(partial), len(spans))] if partial else [])
+            self._apply_word_links(attributed, full_text, link_spans)
         self.original_view.textStorage().setAttributedString_(attributed)
         self.original_view.scrollRangeToVisible_(self.NSMakeRange(len(full_text), 0))
 
@@ -2522,11 +2525,19 @@ class GlassOverlay:
 
     def _apply_word_links(self, attributed, full_text, spans):
         table = []
+        previous_text = ""
         for start, length, _idx in spans:
             block_text = full_text[start : start + length]
+            # Lookup context also carries the previous block: blocks are cut mid-sentence
+            # when speech has no pauses, and the draft continues the last committed block.
+            lookup_text = f"{previous_text} {block_text}" if previous_text else block_text
+            shift = len(lookup_text) - len(block_text)
+            previous_text = block_text
             for match in WORD_RE.finditer(block_text):
                 link = f"{LOOKUP_LINK_PREFIX}{len(table)}"
-                table.append({"block": block_text, "start": match.start(), "end": match.end()})
+                table.append(
+                    {"block": lookup_text, "start": shift + match.start(), "end": shift + match.end()}
+                )
                 attributed.addAttribute_value_range_(
                     self.NSLinkAttributeName,
                     link,
