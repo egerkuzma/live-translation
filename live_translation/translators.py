@@ -118,6 +118,11 @@ class OllamaTranslator:
         self.source = source
 
     def translate(self, text, max_tokens=None, on_delta=None, history=None):
+        # Same source and target language: nothing to translate, pass text through.
+        if self.source and self.target and self.source == self.target:
+            if on_delta is not None:
+                on_delta(text)
+            return text
         num_predict = int(max_tokens or self.max_tokens)
         options = {
             "temperature": self.temperature,

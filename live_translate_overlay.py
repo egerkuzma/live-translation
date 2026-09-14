@@ -82,9 +82,8 @@ WHISPER_MENU = [
 WHISPER_LABELS = dict(WHISPER_MENU)
 
 GEMMA_MODELS = {
-    "gemma4:26b-mlx": "Gemma 4 26B",
+    "qwen3.5:4b": "Qwen 3.5 4B",
     "gemma4:e4b-mlx": "Gemma 4 E4B",
-    "gemma4:12b-mlx": "Gemma 4 12B",
 }
 
 GEMMA_MENU = list(GEMMA_MODELS.items())
@@ -3862,7 +3861,7 @@ def parse_args():
     p.add_argument(
         "--ollama-model",
         choices=GEMMA_MODELS.keys(),
-        default="gemma4:26b-mlx",
+        default="qwen3.5:4b",
         help="Ollama Gemma 4 model",
     )
     p.add_argument("--ollama-url", default="http://127.0.0.1:11434", help="Ollama server URL")

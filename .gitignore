@@ -38,3 +38,5 @@ coverage.xml
 .vscode/
 .idea/
 *.swp
+*.bak
+.venv/
