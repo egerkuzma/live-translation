@@ -131,6 +131,13 @@ STATUS_UPDATE_INTERVAL_SECONDS = 0.25
 # apostrophes/hyphens ("don't", "well-known"); punctuation stays unclickable.
 WORD_RE = re.compile(r"[A-Za-z]+(?:['\u2019-][A-Za-z]+)*")
 LOOKUP_LINK_PREFIX = "lookup:"
+# Default mode is word lookup: the right column explains clicked words and the
+# transcript blocks are not translated. --translate-blocks restores the old behaviour.
+BLOCK_TRANSLATION_ENABLED = True
+WAITING_LOOKUP = {
+    "en": "Click a word on the left to look it up…",
+    "ru": "Кликни слово слева, чтобы разобрать его…",
+}
 TRANSLATION_TAIL_REGROUP_SECONDS = 8.0
 TRANSLATION_TAIL_MAX_MERGED_CHARS = 420
 TRANSLATION_TAIL_MAX_SOURCE_MERGED_CHARS = 1400
@@ -305,7 +312,17 @@ def _glass_pdf_view_class():
 
 
 class GlassOverlay:
-    def __init__(self, stop_event, settings: LanguageSettings, title, width, height, opacity, show_partial=False):
+    def __init__(
+        self,
+        stop_event,
+        settings: LanguageSettings,
+        title,
+        width,
+        height,
+        opacity,
+        show_partial=False,
+        lookup_mode=True,
+    ):
         try:
             from Cocoa import (
                 NSApp,
@@ -380,6 +397,7 @@ class GlassOverlay:
         self.partial_text = ""
         self.partial_translation = ""
         self.show_partial = show_partial
+        self.lookup_mode = lookup_mode
         self.translated_text = ""
         self.original_blocks = []
         self.translation_blocks = []
@@ -1414,6 +1432,8 @@ class GlassOverlay:
             code = self.settings.get()[1]
         except Exception:
             code = "en"
+        if self.lookup_mode:
+            return WAITING_LOOKUP.get(code, WAITING_LOOKUP["en"])
         return WAITING_TRANSLATION.get(code, WAITING_TRANSLATION["en"])
 
     def _target_changed(self, sender):
@@ -2589,7 +2609,7 @@ def enqueue_translation(
     end_seconds=None,
     confidence=None,
 ):
-    if not source_text:
+    if not source_text or not BLOCK_TRANSLATION_ENABLED:
         return
     if translation_q.maxsize and translation_q.qsize() >= translation_q.maxsize:
         dropped = drain_queue_keep_latest(translation_q, TRANSLATION_QUEUE_KEEP_TASKS)
@@ -3990,6 +4010,12 @@ def parse_args():
         help="maximum semantic block size before translation",
     )
     p.add_argument(
+        "--translate-blocks",
+        action="store_true",
+        help="legacy mode: translate every transcript block into the right column; "
+        "by default the right column explains words you click",
+    )
+    p.add_argument(
         "--max-sentences",
         type=int,
         default=5,
@@ -4085,11 +4111,14 @@ def main():
     chunk_q = queue.Queue(maxsize=args.chunk_queue)
     translation_q = queue.Queue(maxsize=args.translation_queue)
 
+    global BLOCK_TRANSLATION_ENABLED
+    BLOCK_TRANSLATION_ENABLED = bool(args.translate_blocks)
     print("Loading translator...")
     translator = build_translator(args)
+    right_column = f"translate -> {args.target}" if args.translate_blocks else f"word lookup ({args.target})"
     print(
         f"Start: {info['name']} -> Whisper {args.whisper} -> "
-        f"Ollama {args.ollama_model} -> {args.target}"
+        f"Ollama {args.ollama_model} -> {right_column}"
     )
 
     overlay = (
@@ -4103,6 +4132,7 @@ def main():
             height=args.height,
             opacity=args.opacity,
             show_partial=args.show_partial,
+            lookup_mode=not args.translate_blocks,
         )
     )
     overlay.reset_gen = reset_gen
@@ -4113,12 +4143,15 @@ def main():
             args=(audio_q, stop_event, device, samplerate, channels, args.block_seconds),
             daemon=True,
         ),
-        threading.Thread(
-            target=translation_worker,
-            args=(translation_q, overlay, translator, stop_event, settings, reset_gen),
-            daemon=True,
-        ),
     ]
+    if args.translate_blocks:
+        workers.append(
+            threading.Thread(
+                target=translation_worker,
+                args=(translation_q, overlay, translator, stop_event, settings, reset_gen),
+                daemon=True,
+            )
+        )
     if args.legacy_chunking:
         workers += [
             threading.Thread(
