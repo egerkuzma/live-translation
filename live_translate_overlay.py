@@ -2487,7 +2487,7 @@ class GlassOverlay:
             link_spans = spans + ([(partial_start, len(partial), len(spans))] if partial else [])
             self._apply_word_links(attributed, full_text, link_spans)
         self.original_view.textStorage().setAttributedString_(attributed)
-        self.original_view.scrollRangeToVisible_(self.NSMakeRange(len(full_text), 0))
+        self._scroll_to_end(self.original_view)
 
     def _render_translation(self):
         if self.lookup_mode:
@@ -2522,7 +2522,7 @@ class GlassOverlay:
                 self.NSMakeRange(partial_start, len(partial)),
             )
         self.translated_view.textStorage().setAttributedString_(attributed)
-        self.translated_view.scrollRangeToVisible_(self.NSMakeRange(len(full_text), 0))
+        self._scroll_to_end(self.translated_view)
 
     def _apply_word_links(self, attributed, full_text, spans):
         table = []
@@ -2648,7 +2648,13 @@ class GlassOverlay:
                 add(context[start:end], "context_word")
                 add(context[end:], "context")
         self.translated_view.textStorage().setAttributedString_(attributed)
-        self.translated_view.scrollRangeToVisible_(self.NSMakeRange(attributed.length(), 0))
+        self._scroll_to_end(self.translated_view)
+
+    def _scroll_to_end(self, text_view):
+        # Finish layout before scrolling: with frequent updates NSTextView otherwise
+        # scrolls to an estimated end and the newest line stays just below the view.
+        text_view.layoutManager().ensureLayoutForTextContainer_(text_view.textContainer())
+        text_view.scrollRangeToVisible_(self.NSMakeRange(text_view.textStorage().length(), 0))
 
     def _compose_blocks(self, blocks):
         chunks = []
